@@ -81,6 +81,8 @@ Xem các tool hiện có:
 
 ```bash
 day09 mcp-tools
+# Xem thêm mô tả và JSON Schema của từng tool:
+day09 mcp-tools --json
 ```
 
 Ví dụ gọi tool trong `workflow.py`:
@@ -146,10 +148,50 @@ Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 
 ## 6. Chạy và kiểm tra
 
+Workflow đã có bản triển khai quy tắc xác định, sử dụng MCP evidence và policy.
+Các vai trò trao đổi nội bộ qua `AgentReport`; chi tiết và các giả định nghiệp vụ
+được ghi trong `ARCHITECTURE.md`.
+
+Có thể kiểm tra một case trước:
+
+```bash
+day09 run --case-id L3A_CASE_001
+```
+
+Mỗi lần `run` lưu riêng tại `dist/runs/<run_id>/`. Khi lượt chạy hoàn tất và mọi
+case đều có evidence, kết quả mới thay thế `outputs/` và `traces/trace.jsonl`.
+Lượt lỗi giữ nguyên kết quả đã có; ba case liên tiếp không có evidence sẽ dừng sớm.
+Sau smoke test thành công, chạy toàn bộ 100 case để đủ điều kiện validate/đóng gói:
+
 ```bash
 day09 run
 day09 validate
 ```
+
+Nếu MCP của ban tổ chức đang có tải cao, chạy tuần tự và giãn truy vấn:
+
+```bash
+MCP_REQUEST_INTERVAL_SECONDS=1.5 day09 run
+```
+
+Khi giá trị này lớn hơn 0, mỗi lần chỉ có một tool call đang chạy, rồi nghỉ theo
+số giây đã cấu hình trước khi gọi tiếp, kể cả khi tool trả lỗi. Mặc định là 0
+(giữ cơ chế tối đa ba specialist gọi đồng thời). Lỗi chung từ server vẫn được
+coi là thiếu evidence, không tự suy diễn thành dữ liệu rỗng.
+
+Nếu lượt chạy bị gián đoạn, tiếp tục chính thư mục được CLI báo:
+
+```bash
+MCP_REQUEST_INTERVAL_SECONDS=0.5 day09 run --resume-run dist/runs/<run_id>
+```
+
+Checkpoint kiểm tra team key (chỉ lưu hash), endpoint, bộ input và danh sách case.
+Các case hoàn tất được giữ nguyên; case có lỗi tool được truy vấn lại từ đầu,
+trace cũ của lần thử được lưu riêng để chẩn đoán. CLI tự kết nối lại tối đa một
+lần mỗi lần gọi lệnh. Không ghép các thư mục run khác nhau. Phiên kết nối MCP
+khác với run chấm thi: checkpoint cục bộ không xác nhận run phía ban tổ chức.
+Nếu run chấm thi đã reset, phải chạy mới; quyền sở hữu ref vẫn do MCP audit xác nhận.
+Thư mục cũ chưa có `context.json` không được tự động tiếp tục.
 
 Kết quả được tạo tại:
 

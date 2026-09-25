@@ -1,9 +1,60 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+from .evidence import CaseEvidence
 from .mcp_gateway import EvidenceGateway
+from .reasoning import InvestigationError, investigate
 from .trace import TraceWriter
+from .verifier import verify
+
+
+def _incomplete(
+    case: dict[str, Any],
+    evidence: CaseEvidence,
+    *,
+    conflicts: list[dict] | None = None,
+) -> dict[str, Any]:
+    refs = evidence.refs(*evidence.records)
+    order = evidence.data("get_order", {})
+    return {
+        "schema_version": "day09-l3a-output-v2",
+        "case_id": evidence.case_id,
+        "assessment": {
+            "primary_issue": "insufficient_evidence",
+            "case_status": "needs_investigation",
+            "confidence": 0.45,
+        },
+        "affected_entities": {
+            "order_ids": [order["order_id"]] if order.get("order_id") else [],
+            "item_ids": [],
+            "seller_ids": [],
+            "payment_references": [],
+            "shipment_ids": [],
+        },
+        "claim_assessments": [
+            {
+                "claim_id": claim["claim_id"],
+                "verdict": "insufficient_evidence",
+                "confidence": 0.45,
+                "evidence_refs": refs,
+            }
+            for claim in case.get("customer_request", {}).get("claims", [])
+        ],
+        "root_cause_analysis": {
+            "ranked_causes": [{"cause_code": "EVIDENCE_INCOMPLETE", "rank": 1}],
+            "responsible_parties": [{"party_type": "unknown", "party_id": None}],
+        },
+        "evidence_refs": refs,
+        "data_conflicts": conflicts or [],
+        "financial_resolution": {
+            "currency": "BRL",
+            "recommended_refund_brl": 0,
+            "refund_lines": [],
+        },
+        "resolution_actions": ["investigate_missing_evidence"],
+    }
 
 
 async def solve_case(

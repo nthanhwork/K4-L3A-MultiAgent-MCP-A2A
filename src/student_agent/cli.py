@@ -3,13 +3,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
+from uuid import uuid4
+
+import httpx2
 
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
+from .run_state import RetryableRunError, prepare_attempt, run_context
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
@@ -19,20 +24,66 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
-async def _show_tools(root: Path) -> None:
+async def _show_tools(root: Path, *, as_json: bool = False) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        if as_json:
+            print(json.dumps(await gateway.describe_tools(), ensure_ascii=False, indent=2))
+        else:
+            for tool in await gateway.list_tools():
+                print(tool)
 
 
-async def _run(root: Path) -> None:
+def _transport_failure(exc: BaseException) -> bool:
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(_transport_failure(item) for item in exc.exceptions)
+    return isinstance(exc, (httpx2.TransportError, TimeoutError))
+
+
+async def _run(
+    root: Path,
+    *,
+    case_id: str | None = None,
+    resume_run: Path | None = None,
+) -> None:
+    run_root = (resume_run or root / "dist" / "runs" / uuid4().hex).resolve()
+    for attempt in range(2):
+        try:
+            await _run_once(root, case_id=case_id, run_root=run_root)
+            return
+        except (RetryableRunError, ExceptionGroup, httpx2.TransportError, TimeoutError) as exc:
+            if not isinstance(exc, RetryableRunError) and not _transport_failure(exc):
+                raise
+            if attempt:
+                detail = f" {exc}" if isinstance(exc, RetryableRunError) else ""
+                raise RuntimeError(
+                    f"MCP recovery exhausted; run is incomplete. Checkpoint: {run_root}.{detail}"
+                ) from exc
+            print(
+                "MCP unavailable; reconnecting to retry unfinished cases (1/1).",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(5.0)
+
+
+async def _run_once(
+    root: Path,
+    *,
+    case_id: str | None = None,
+    run_root: Path | None = None,
+) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
+    if case_id is not None and case_id not in case_set.case_ids:
+        raise ValueError(f"Unknown case ID: {case_id}")
+    selected_ids = (case_id,) if case_id else case_set.case_ids
     contracts = Contracts(root / "contracts" / "schemas")
-    output_root = root / "outputs"
-    trace_path = root / "traces" / "trace.jsonl"
+    run_root = run_root or root / "dist" / "runs" / uuid4().hex
+    completed = prepare_attempt(run_root, run_context(settings, case_set, selected_ids), contracts)
+    output_root = run_root / "outputs"
+    trace_path = run_root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     trace = TraceWriter(trace_path, contracts)
@@ -87,8 +138,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--root", default=".", help="repository root (default: current directory)")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
-    commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    tools = commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
+    tools.add_argument("--json", action="store_true", help="include tool descriptions and schemas")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--case-id", help="smoke test one case; publishes a fresh output/trace set on completion"
+    )
+    run.add_argument("--resume-run", type=Path, help="resume a saved run with matching context")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -102,13 +158,12 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
-            asyncio.run(_show_tools(root))
+            asyncio.run(_show_tools(root, as_json=args.json))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, case_id=args.case_id, resume_run=args.resume_run))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")
