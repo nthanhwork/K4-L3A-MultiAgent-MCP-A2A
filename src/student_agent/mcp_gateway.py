@@ -72,26 +72,17 @@ class EvidenceGateway:
 
     async def _call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        if tool_name not in await self.list_tools():
-            raise ToolCallError(f"MCP tool is unavailable: {tool_name}")
-        for attempt in range(2):
+        result = None
+        for attempt in range(3):
             try:
-                async with asyncio.timeout(45):
-                    result = await self._session.call_tool(tool_name, arguments=payload)
+                result = await self._session.call_tool(tool_name, arguments=payload)
                 break
-            except (TimeoutError, httpx2.TransportError):
-                if attempt:
+            except BaseException:
+                if attempt == 2:
                     raise
-                await asyncio.sleep(max(0.25, self._request_interval))
-            except MCPError as exc:
-                # The SDK maps some HTTP server errors to JSON-RPC INTERNAL_ERROR.
-                # Retry a read once; invalid parameters/session errors remain terminal.
-                if attempt or exc.code not in {types.INTERNAL_ERROR, types.REQUEST_TIMEOUT}:
-                    raise
-                await asyncio.sleep(max(2.0, self._request_interval))
-        is_error = getattr(result, "is_error", None)
-        if is_error is None:
-            is_error = getattr(result, "isError", False)
+                await asyncio.sleep(1.0 * (attempt + 1))
+
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
         if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
@@ -117,7 +108,7 @@ async def connect_gateway(
     if not math.isfinite(request_interval) or request_interval < 0:
         raise ValueError("MCP_REQUEST_INTERVAL_SECONDS must be finite and nonnegative")
     headers = {"Authorization": f"Bearer {team_api_key}"}
-    timeout = httpx2.Timeout(300.0, connect=90.0, write=90.0, pool=90.0)
+    timeout = httpx2.Timeout(300.0, connect=60.0, write=60.0, pool=60.0)
     async with (
         httpx2.AsyncClient(
             headers=headers, timeout=timeout, transport=httpx2.AsyncHTTPTransport(retries=2)

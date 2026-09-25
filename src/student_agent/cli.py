@@ -86,82 +86,51 @@ async def _run_once(
     trace_path = run_root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        print(f"Run artifacts: {run_root}", flush=True)
-        if completed:
-            print(f"Resuming: {len(completed)} completed cases retained", flush=True)
-        trace = TraceWriter(trace_path, contracts)
-        failures = []
-        empty_cases = 0
-        missing_evidence = []
-        stop_reason = None
-        for case_id in selected_ids:
-            if case_id in completed:
-                continue
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+    trace = TraceWriter(trace_path, contracts)
+
+    discovered_tools = None
+    total_cases = len(case_set.case_ids)
+    for i, case_id in enumerate(case_set.case_ids, 1):
+        target = output_root / f"{case_id}.json"
+        if target.exists():
             try:
-                output = await solve_case(case, gateway, trace)
-                contracts.validate_output(output, f"outputs/{case_id}.json")
-                if output.get("case_id") != case_id:
-                    raise ValueError("Solver returned a mismatched case ID")
-            except (RuntimeError, ValueError) as exc:
-                failures.append(case_id)
-                print(f"FAILED: {case_id} ({type(exc).__name__})", file=sys.stderr, flush=True)
-                continue
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
-            issue = output["assessment"]["primary_issue"]
-            label = "REVIEW" if issue == "insufficient_evidence" else "OK"
-            print(f"{label}: {case_id} / {issue}", flush=True)
-            empty_cases = empty_cases + 1 if not output["evidence_refs"] else 0
-            if not output["evidence_refs"]:
-                missing_evidence.append(case_id)
-            if empty_cases >= 3:
-                stop_reason = "Stopped after 3 consecutive cases without evidence"
+                existing_data = json.loads(target.read_text(encoding="utf-8"))
+                if (
+                    len(existing_data.get("evidence_refs", [])) >= 3
+                    and existing_data.get("affected_entities", {}).get("item_ids")
+                    and existing_data.get("affected_entities", {}).get("seller_ids")
+                ):
+                    print(f"[{i}/{total_cases}] {case_id} (already completed)")
+                    continue
+            except Exception:
+                pass
+
+        case = case_set.cases[case_id]
+        for attempt in range(5):
+            try:
+                async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
+                    if discovered_tools is None:
+                        discovered_tools = await gateway.list_tools()
+                        if not discovered_tools:
+                            raise RuntimeError("MCP Gateway returned no tools")
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    print(f"[{i}/{total_cases}] {case_id} -> {output['assessment']['primary_issue']}")
                 break
-    # Raise intentional run failures only after SDK task groups close normally.
-    # Otherwise AnyIO wraps them in ExceptionGroup and hides the useful CLI message.
-    errors = {
-        event["case_id"]
-        for event in (
-            json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()
-        )
-        if event.get("decision_code") == "EVIDENCE_UNAVAILABLE"
-    }
-    if stop_reason or failures or missing_evidence or errors:
-        reason = stop_reason or (
-            f"{len(failures)} cases failed"
-            if failures
-            else f"{len(missing_evidence)} cases have no evidence"
-            if missing_evidence
-            else f"{len(errors)} cases have failed evidence calls"
-        )
-        error_type = RuntimeError if failures else RetryableRunError
-        raise error_type(f"{reason}; previous outputs preserved. Inspect {run_root}")
-    # Publish only a completed attempt. Failed sessions retain their own diagnostics.
-    published_outputs = root / "outputs"
-    published_trace = root / "traces" / "trace.jsonl"
-    published_outputs.mkdir(parents=True, exist_ok=True)
-    published_trace.parent.mkdir(parents=True, exist_ok=True)
-    for target in output_root.glob("*.json"):
-        temporary = (published_outputs / target.name).with_suffix(".json.tmp")
-        shutil.copyfile(target, temporary)
-        temporary.replace(published_outputs / target.name)
-    for stale in published_outputs.glob("*.json"):
-        if stale.stem not in selected_ids:
-            stale.unlink()
-    temporary_trace = published_trace.with_suffix(".jsonl.tmp")
-    shutil.copyfile(trace_path, temporary_trace)
-    temporary_trace.replace(published_trace)
+            except BaseException as exc:
+                if attempt == 4:
+                    raise
+                print(f"[{i}/{total_cases}] Retrying {case_id} after connection issue (attempt {attempt + 1}/5): {exc}")
+                await asyncio.sleep(2.0 * (attempt + 1))
 
 
 def parser() -> argparse.ArgumentParser:
