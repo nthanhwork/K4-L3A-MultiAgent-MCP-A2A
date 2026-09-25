@@ -3,13 +3,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
+from uuid import uuid4
+
+import httpx2
 
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
+from .run_state import RetryableRunError, prepare_attempt, run_context
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
@@ -19,38 +24,94 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
-async def _show_tools(root: Path) -> None:
+async def _show_tools(root: Path, *, as_json: bool = False) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        if as_json:
+            print(json.dumps(await gateway.describe_tools(), ensure_ascii=False, indent=2))
+        else:
+            for tool in await gateway.list_tools():
+                print(tool)
 
 
-async def _run(root: Path) -> None:
+def _transport_failure(exc: BaseException) -> bool:
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(_transport_failure(item) for item in exc.exceptions)
+    return isinstance(exc, (httpx2.TransportError, TimeoutError))
+
+
+async def _run(
+    root: Path,
+    *,
+    case_id: str | None = None,
+    resume_run: Path | None = None,
+) -> None:
+    run_root = (resume_run or root / "dist" / "runs" / uuid4().hex).resolve()
+    for attempt in range(2):
+        try:
+            await _run_once(root, case_id=case_id, run_root=run_root)
+            return
+        except (RetryableRunError, ExceptionGroup, httpx2.TransportError, TimeoutError) as exc:
+            if not isinstance(exc, RetryableRunError) and not _transport_failure(exc):
+                raise
+            if attempt:
+                detail = f" {exc}" if isinstance(exc, RetryableRunError) else ""
+                raise RuntimeError(
+                    f"MCP recovery exhausted; run is incomplete. Checkpoint: {run_root}.{detail}"
+                ) from exc
+            print(
+                "MCP unavailable; reconnecting to retry unfinished cases (1/1).",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(5.0)
+
+
+async def _run_once(
+    root: Path,
+    *,
+    case_id: str | None = None,
+    run_root: Path | None = None,
+) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
+    if case_id is not None and case_id not in case_set.case_ids:
+        raise ValueError(f"Unknown case ID: {case_id}")
+    selected_ids = (case_id,) if case_id else case_set.case_ids
     contracts = Contracts(root / "contracts" / "schemas")
-    output_root = root / "outputs"
-    trace_path = root / "traces" / "trace.jsonl"
+    run_root = run_root or root / "dist" / "runs" / uuid4().hex
+    completed = prepare_attempt(run_root, run_context(settings, case_set, selected_ids), contracts)
+    output_root = run_root / "outputs"
+    trace_path = run_root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
-
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        print(f"Run artifacts: {run_root}", flush=True)
+        if completed:
+            print(f"Resuming: {len(completed)} completed cases retained", flush=True)
+        trace = TraceWriter(trace_path, contracts)
+        failures = []
+        empty_cases = 0
+        missing_evidence = []
+        stop_reason = None
+        for case_id in selected_ids:
+            if case_id in completed:
+                continue
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+            try:
+                output = await solve_case(case, gateway, trace)
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError("Solver returned a mismatched case ID")
+            except (RuntimeError, ValueError) as exc:
+                failures.append(case_id)
+                print(f"FAILED: {case_id} ({type(exc).__name__})", file=sys.stderr, flush=True)
+                continue
             target = output_root / f"{case_id}.json"
             temporary = target.with_suffix(".json.tmp")
             temporary.write_text(
@@ -58,6 +119,49 @@ async def _run(root: Path) -> None:
             )
             temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            issue = output["assessment"]["primary_issue"]
+            label = "REVIEW" if issue == "insufficient_evidence" else "OK"
+            print(f"{label}: {case_id} / {issue}", flush=True)
+            empty_cases = empty_cases + 1 if not output["evidence_refs"] else 0
+            if not output["evidence_refs"]:
+                missing_evidence.append(case_id)
+            if empty_cases >= 3:
+                stop_reason = "Stopped after 3 consecutive cases without evidence"
+                break
+    # Raise intentional run failures only after SDK task groups close normally.
+    # Otherwise AnyIO wraps them in ExceptionGroup and hides the useful CLI message.
+    errors = {
+        event["case_id"]
+        for event in (
+            json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()
+        )
+        if event.get("decision_code") == "EVIDENCE_UNAVAILABLE"
+    }
+    if stop_reason or failures or missing_evidence or errors:
+        reason = stop_reason or (
+            f"{len(failures)} cases failed"
+            if failures
+            else f"{len(missing_evidence)} cases have no evidence"
+            if missing_evidence
+            else f"{len(errors)} cases have failed evidence calls"
+        )
+        error_type = RuntimeError if failures else RetryableRunError
+        raise error_type(f"{reason}; previous outputs preserved. Inspect {run_root}")
+    # Publish only a completed attempt. Failed sessions retain their own diagnostics.
+    published_outputs = root / "outputs"
+    published_trace = root / "traces" / "trace.jsonl"
+    published_outputs.mkdir(parents=True, exist_ok=True)
+    published_trace.parent.mkdir(parents=True, exist_ok=True)
+    for target in output_root.glob("*.json"):
+        temporary = (published_outputs / target.name).with_suffix(".json.tmp")
+        shutil.copyfile(target, temporary)
+        temporary.replace(published_outputs / target.name)
+    for stale in published_outputs.glob("*.json"):
+        if stale.stem not in selected_ids:
+            stale.unlink()
+    temporary_trace = published_trace.with_suffix(".jsonl.tmp")
+    shutil.copyfile(trace_path, temporary_trace)
+    temporary_trace.replace(published_trace)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -65,8 +169,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--root", default=".", help="repository root (default: current directory)")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
-    commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    tools = commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
+    tools.add_argument("--json", action="store_true", help="include tool descriptions and schemas")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--case-id", help="smoke test one case; publishes a fresh output/trace set on completion"
+    )
+    run.add_argument("--resume-run", type=Path, help="resume a saved run with matching context")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -80,13 +189,12 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
-            asyncio.run(_show_tools(root))
+            asyncio.run(_show_tools(root, as_json=args.json))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, case_id=args.case_id, resume_run=args.resume_run))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")
